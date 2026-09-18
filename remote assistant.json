@@ -1,0 +1,1041 @@
+// ==UserScript==
+// @name         远程题库助手
+// @namespace    http://tampermonkey.net/
+// @version      3.9
+// @description  answering the questions of supervisor professional skills competition
+// @match        https://exam.cdeledu.com/*
+// @match        https://jxjyqz.cdeledu.com/*
+// @author       Sumsols Wang
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+(function () {
+    'use strict';
+    /* =========================================================
+     * 0. 随机前缀，避免固定 ID/class 特征
+     * =======================================================*/
+    const RND = Math.random().toString(36).slice(2, 8);
+    const P = 'ah_' + RND + '_';
+    const ID_PANEL = P + 'panel';
+    const ID_DRAG  = P + 'drag';
+    const ID_STAT  = P + 'stat';
+    const ID_MSG   = P + 'msg';
+    const CLS_FLAG = P + 'flag';
+    const CLS_OK   = P + 'ok';
+    const CLS_NO   = P + 'no';
+    const CLS_MINBTN = P + 'minbtn';
+    const CLS_ADVBTN = P + 'advbtn';
+    /* =========================================================
+     * 1. 样式注入
+     * =======================================================*/
+    function injectStyle(css) {
+        const style = document.createElement('style');
+        style.type = 'text/css';
+        style.textContent = css;
+        (document.head || document.documentElement).appendChild(style);
+    }
+    injectStyle(`
+        #${ID_PANEL}{position:fixed;bottom:20px;right:20px;width:330px;background:#fff;border:2px solid #2196F3;
+            border-radius:8px;z-index:999999;padding:12px;font-size:13px;max-height:85vh;overflow:auto;
+            box-shadow:0 4px 16px rgba(0,0,0,.18);font-family:"Microsoft YaHei",sans-serif}
+        #${ID_PANEL} h3{margin:0 0 8px;color:#2196F3;font-size:15px;cursor:move;user-select:none}
+        #${ID_PANEL} .ah-row{margin:7px 0}
+        #${ID_PANEL} textarea,#${ID_PANEL} input{box-sizing:border-box;padding:4px;border:1px solid #ccc;border-radius:4px;font-size:12px}
+        #${ID_PANEL} textarea{width:100%}
+        #${ID_PANEL} input[type=text],#${ID_PANEL} input[type=password]{width:100%}
+        #${ID_PANEL} button{padding:4px 8px;margin:2px;cursor:pointer;border:1px solid #2196F3;background:#eaf4fe;
+            border-radius:4px;font-size:12px}
+        #${ID_PANEL} button:hover{background:#2196F3;color:#fff}
+        #${ID_PANEL} button:disabled{opacity:.55;cursor:not-allowed}
+        #${ID_PANEL} .ah-stat{font-weight:bold;padding:6px;background:#f5f5f5;border-radius:4px;line-height:1.7}
+        #${ID_PANEL}.ah-min{width:auto;padding:6px 10px}
+        #${ID_PANEL}.ah-min .ah-body{display:none}
+        #${ID_PANEL} .${CLS_MINBTN},#${ID_PANEL} .${CLS_ADVBTN}{float:right;margin-left:10px;cursor:pointer;font-weight:bold;color:#2196F3;user-select:none}
+        #${ID_PANEL} .ah-adv{display:none;border-top:1px dashed #ccc;margin-top:8px;padding-top:4px}
+        #${ID_PANEL}.ah-adv-open .ah-adv{display:block}
+        .${CLS_FLAG}{margin:6px 0;padding:8px 10px;border-radius:6px;font-size:14px;line-height:1.8;
+            font-family:"Microsoft YaHei",sans-serif}
+        .${CLS_FLAG}.${CLS_OK}{background:#eafaf0;border:1px solid #52c41a;color:#137333}
+        .${CLS_FLAG}.${CLS_NO}{background:#fff1f0;border:1px solid #ff4d4f;color:#cf1322}
+        .${CLS_FLAG}.has-fuzzy{background:#fffbe6;border-color:#faad14;color:#ad6800}
+        .${CLS_FLAG} .ah-same{color:#137333;font-size:12px}
+        .${CLS_FLAG} .ah-note{color:#d46b08;font-size:12px;margin:2px 0}
+        .${CLS_FLAG} b{font-size:16px}
+        .${CLS_FLAG} .ah-prompt{background:#f0f5ff;border:1px dashed #597ef7;color:#1d39c4;border-radius:4px;padding:4px 6px;margin:4px 0}
+        .${CLS_FLAG} .ah-prompt input{width:64px;margin:0 4px;padding:2px 4px}
+        .${CLS_FLAG} .ah-prompt button{padding:1px 8px;font-size:12px;cursor:pointer;border-radius:3px;border:1px solid #597ef7;color:#1d39c4;background:#fff}
+        .ah-tag{display:inline-block;font-size:12px;padding:0 6px;border-radius:8px;background:#ddd;margin-left:6px}
+    `);
+    /* =========================================================
+     * 1b. 面板位置（默认右下角，拖拽记忆，防止拖出屏幕）
+     * =======================================================*/
+    const POS_KEY = 'cdeledu_panel_pos_v1';
+    const PanelPos = {
+        get() {
+            try { return JSON.parse(localStorage.getItem(POS_KEY) || 'null'); }
+            catch (e) { return null; }
+        },
+        save(pos) { localStorage.setItem(POS_KEY, JSON.stringify(pos)); }
+    };
+    /* =========================================================
+     * 1c. 远程题库（GitHub 只读来源，后台维护）
+     *      优先 raw.githubusercontent.com 直链（推送后即时可见，无 CDN 缓存延迟），
+     *      jsDelivr CDN 作为兜底；再不行退回本地缓存
+     * =======================================================*/
+    const REMOTE_URL_RAW = 'https://raw.githubusercontent.com/aboywang/supervisor-answer-bank/main/answer.json';
+    const REMOTE_URL_CDN = 'https://cdn.jsdelivr.net/gh/aboywang/supervisor-answer-bank@main/answer.json';
+    const REMOTE_URL = REMOTE_URL_RAW;   // 面板展示用主源
+    const BANK_CACHE_KEY = 'cdeledu_remote_bank_cache_v1';
+    const BANK_META_KEY  = 'cdeledu_remote_bank_meta_v1';
+    const RemoteBank = {
+        cache() {
+            try {
+                const raw = localStorage.getItem(BANK_CACHE_KEY);
+                const data = raw ? JSON.parse(raw) : null;
+                return Array.isArray(data) ? data : null;
+            } catch (e) { return null; }
+        },
+        meta() {
+            try { return JSON.parse(localStorage.getItem(BANK_META_KEY) || '{}') || {}; }
+            catch (e) { return {}; }
+        },
+        save(data, fetchedAt) {
+            localStorage.setItem(BANK_CACHE_KEY, JSON.stringify(data));
+            localStorage.setItem(BANK_META_KEY, JSON.stringify({
+                url: REMOTE_URL,
+                fetchedAt: fetchedAt || new Date().toISOString()
+            }));
+        },
+        list() {
+            const c = this.cache();
+            return c || [];
+        },
+        async fetchLatest() {
+            /* 依次尝试：raw 直链（即时最新）→ jsDelivr CDN（兜底） */
+            let lastErr = null;
+            for (const url of [REMOTE_URL_RAW, REMOTE_URL_CDN]) {
+                try {
+                    const res = await fetch(url, { cache: 'no-store' });
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    const data = await res.json();
+                    const arr = Array.isArray(data) ? data : [data];
+                    arr.forEach(it => {
+                        if (!it || !it.q) throw new Error('远程题库存在缺少 q(题干) 字段的题目');
+                        if (!it.ans) throw new Error('远程题库存在缺少 ans(答案) 字段的题目');
+                    });
+                    if (url === REMOTE_URL_CDN && this.cache() && this.cache().length > arr.length) {
+                        /* CDN 滞后于本地缓存（推送后 CDN 未更新）：优先本地已推送内容 */
+                        console.log('[题库助手] jsDelivr 内容滞后，使用本地缓存（' + this.cache().length + ' 题）');
+                        return this.cache();
+                    }
+                    return arr;
+                } catch (e) { lastErr = e; }
+            }
+            throw lastErr || new Error('远程题库获取失败');
+        }
+    };
+    /* =========================================================
+     * 1d. GitHub 同步（写入 answer.json；默认配置内置，后台自动执行）
+     *      ⚠ Token 仅保存在本脚本与本地浏览器，请勿外传脚本文件
+     *      推送串行队列 + 409 冲突自动重读重试（最多 3 次），连录/多端并发不再失败
+     * =======================================================*/
+    const GH_KEY = 'cdeledu_gh_config_v1';
+    const GH_DEFAULT = {
+        repo: 'aboywang/supervisor-answer-bank',
+        branch: 'main',
+        token: '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',
+        auto: true
+    };
+    const GH = {
+        get() {
+            /* 内置默认配置优先；localStorage 中仅非空值可覆盖（防止空配置覆盖 Token） */
+            const def = Object.assign({}, GH_DEFAULT);
+            try {
+                const s = JSON.parse(localStorage.getItem(GH_KEY) || '{}') || {};
+                if (s.repo) def.repo = s.repo;
+                if (s.branch) def.branch = s.branch;
+                if (s.token) def.token = s.token;
+                if (typeof s.auto === 'boolean') def.auto = s.auto;
+                return def;
+            } catch (e) { return def; }
+        },
+        save(c) { localStorage.setItem(GH_KEY, JSON.stringify(c)); },
+        api() {
+            const c = this.get();
+            if (!c.repo || !c.token) throw new Error('未配置 GitHub 仓库或 Token');
+            const parts = String(c.repo).trim().split('/');
+            if (parts.length !== 2 || !parts[0] || !parts[1]) throw new Error('仓库格式应为 owner/repo');
+            return { c, owner: parts[0], repo: parts[1], branch: String(c.branch || 'main').trim() || 'main' };
+        },
+        headers() {
+            return { 'Authorization': 'token ' + this.get().token, 'Accept': 'application/vnd.github+json' };
+        },
+        fileUrl(owner, repo, branch) {
+            return 'https://api.github.com/repos/' + owner + '/' + repo +
+                '/contents/answer.json?ref=' + encodeURIComponent(branch);
+        },
+        b64decode(b64) { return decodeURIComponent(escape(atob(String(b64).replace(/\s/g, '')))); },
+        b64encode(str) { return btoa(unescape(encodeURIComponent(str))); },
+        async readRemote(owner, repo, branch) {
+            const res = await fetch(this.fileUrl(owner, repo, branch), { headers: this.headers(), cache: 'no-store' });
+            if (!res.ok) throw new Error('读取 answer.json 失败 HTTP ' + res.status + (res.status === 404 ? '（远程文件不存在？）' : ''));
+            return await res.json();
+        },
+        async writeRemote(owner, repo, branch, sha, arr, message) {
+            const url = 'https://api.github.com/repos/' + owner + '/' + repo + '/contents/answer.json';
+            const res = await fetch(url, {
+                method: 'PUT',
+                headers: Object.assign({ 'Content-Type': 'application/json' }, this.headers()),
+                body: JSON.stringify({
+                    message: message || 'docs: 新增题目（远程题库助手自动录入）',
+                    content: this.b64encode(JSON.stringify(arr, null, 2)),
+                    sha: sha,
+                    branch: branch
+                })
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                const e = new Error('推送失败 HTTP ' + res.status + ' ' + ((err && err.message) || ''));
+                e.status = res.status;   // 供 409 冲突重试判断
+                throw e;
+            }
+            return await res.json();
+        },
+        /* —— 全局推送串行队列：任何时刻只允许一个写操作，避免并发 PUT 撞 sha —— */
+        _pushQueue: Promise.resolve(),
+        enqueue(fn) {
+            const run = this._pushQueue.then(fn, fn);
+            this._pushQueue = run.catch(() => { });
+            return run;
+        },
+        async pushQuestion(q, a, ans) {
+            return this.enqueue(() => this._pushQuestionOnce(q, a, ans));
+        },
+        async _pushQuestionOnce(q, a, ans) {
+            const { owner, repo, branch } = this.api();
+            const cq = cleanText(q);
+            const item = { q, a: Array.isArray(a) ? a : [], ans: String(ans).toUpperCase() };
+            let lastErr = null;
+            /* 409 = 读取后远程文件已被更新（本页连录 / 其他标签页 / 外部提交）：
+               重新拉取最新 sha 并查重后重试，最多 3 次 */
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const file = await this.readRemote(owner, repo, branch);
+                const arr = JSON.parse(this.b64decode(file.content));
+                const exist = arr.find(it => cleanText(it.q) === cq);
+                if (exist) {
+                    return { ok: true, skipped: true, msg: 'ℹ 远程 answer.json 已包含该题，无需推送' };
+                }
+                /* 与远程某题模糊相似 >90%：视为同一题，覆盖更新题干与答案 */
+                const fuzzy = findBestFuzzy(arr, cq);
+                if (fuzzy) {
+                    arr[fuzzy.index] = item;
+                    try {
+                        await this.writeRemote(owner, repo, branch, file.sha, arr);
+                        return { ok: true, updated: true, skipped: false, fuzzyScore: fuzzy.score, arr,
+                            msg: '✅ 已覆盖更新远程相似题（相似度 ' + Math.round(fuzzy.score * 100) + '%），jsDelivr 稍后自动更新' };
+                    } catch (e) {
+                        if (e.status !== 409 || attempt === 2) throw e;
+                        lastErr = e;
+                        await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+                        continue;
+                    }
+                }
+                arr.push(item);
+                try {
+                    await this.writeRemote(owner, repo, branch, file.sha, arr);
+                    return { ok: true, skipped: false, msg: '✅ 已推送远程（jsDelivr 稍后自动更新）', arr };
+                } catch (e) {
+                    if (e.status !== 409 || attempt === 2) throw e;
+                    lastErr = e;
+                    await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+                }
+            }
+            throw lastErr;
+        },
+        async pushAll() {
+            return this.enqueue(() => this._pushAllOnce());
+        },
+        async _pushAllOnce() {
+            const sups = DB.get();
+            if (!sups.length) throw new Error('本地补充题为空，无可推送');
+            const { owner, repo, branch } = this.api();
+            const file = await this.readRemote(owner, repo, branch);
+            const arr = JSON.parse(this.b64decode(file.content));
+            const seen = new Set(arr.map(it => cleanText(it.q)));
+            let pushed = 0;
+            sups.forEach(s => {
+                const cq = cleanText(s.q);
+                if (seen.has(cq)) return;
+                arr.push({ q: s.q, a: Array.isArray(s.a) ? s.a : [], ans: String(s.ans).toUpperCase() });
+                seen.add(cq);
+                pushed++;
+            });
+            if (!pushed) throw new Error('补充题均已存在于远程仓库，无需推送');
+            await this.writeRemote(owner, repo, branch, file.sha, arr);
+            return { pushed, arr };
+        },
+        async test() {
+            const { owner, repo, branch } = this.api();
+            const res = await fetch('https://api.github.com/repos/' + owner + '/' + repo + '/branches/' + encodeURIComponent(branch),
+                { headers: this.headers() });
+            if (!res.ok) throw new Error('连接失败 HTTP ' + res.status);
+            const file = await this.readRemote(owner, repo, branch);
+            const n = JSON.parse(this.b64decode(file.content)).length;
+            return '✅ 连接正常：' + owner + '/' + repo + ' @ ' + branch + '，answer.json 共 ' + n + ' 题';
+        }
+    };
+    /* =========================================================
+     * 2. 本地补充题
+     * =======================================================*/
+    const DB_KEY = 'localQuestionDB_cdeledu_supplement';
+    const DB = {
+        get() {
+            try {
+                const raw = localStorage.getItem(DB_KEY);
+                const arr = raw ? JSON.parse(raw) : [];
+                return Array.isArray(arr) ? arr : [];
+            } catch (e) { return []; }
+        },
+        save(list) { localStorage.setItem(DB_KEY, JSON.stringify(list)); },
+        addNew(q, a, ans) {
+            q = (q || '').trim();
+            ans = (ans || '').trim();
+            if (!q || !ans) return { ok: false, msg: '❌ 题干和答案都不能为空' };
+            const cq = cleanText(q);
+            const remote = RemoteBank.list();
+            const rIdx = remote.findIndex(it => cleanText(it.q) === cq);
+            if (rIdx >= 0) {
+                return { ok: true, alreadyInRemote: true, msg: 'ℹ 远程题库已包含该题（答案 ' + remote[rIdx].ans + '），无需录入' };
+            }
+            const db = this.get();
+            const idx = db.findIndex(it => cleanText(it.q) === cq);
+            if (idx >= 0) {
+                db[idx].a = Array.isArray(a) ? a : [];
+                db[idx].ans = ans.toUpperCase();
+                this.save(db);
+                return { ok: true, msg: '✅ 补充题已更新答案：' + ans.toUpperCase() };
+            }
+            const newItem = { q, a: Array.isArray(a) ? a : [], ans: ans.toUpperCase() };
+            /* 与远程某题模糊相似 >90%：视为同一题，覆盖更新远程原题（本地留一份兜底） */
+            const rf = findBestFuzzy(remote, cq);
+            if (rf) {
+                const rq = cleanText(remote[rf.index].q);
+                const di = db.findIndex(it => cleanText(it.q) === rq);
+                if (di >= 0) db[di] = newItem; else db.push(newItem);
+                this.save(db);
+                return { ok: true, fuzzyRemote: true, fuzzyScore: rf.score,
+                    msg: '⚠ 与远程题库相似度 ' + Math.round(rf.score * 100) + '%，录入将覆盖更新远程原题' };
+            }
+            /* 与本地补充题模糊相似 >90%：覆盖更新本地原题，再同步远程 */
+            const sf = findBestFuzzy(db, cq);
+            if (sf) {
+                db[sf.index] = newItem;
+                this.save(db);
+                return { ok: true, fuzzyScore: sf.score,
+                    msg: '✅ 已覆盖更新本地相似补充题（相似度 ' + Math.round(sf.score * 100) + '%），并同步远程' };
+            }
+            db.push(newItem);
+            this.save(db);
+            return { ok: true, msg: '✅ 已录入本地补充题，答案：' + ans.toUpperCase() };
+        },
+        clear() { this.save([]); }
+    };
+    /* =========================================================
+     * 3. 文本清洗与匹配
+     * =======================================================*/
+    function cleanText(str) {
+        return (str || '')
+            .replace(/[　\s\r\n\t]+/g, '')
+            .replace(/[?？.．。，,！!；;：:、（）()\[\]【】"'“”‘’\-—_＿\/\\~～*#]/g, '')
+            .toLowerCase();
+    }
+    function similarity(a, b) {
+        const m = a.length, n = b.length;
+        if (!m || !n) return 0;
+        const dp = Array.from({ length: m + 1 }, (_, i) => {
+            const row = new Array(n + 1);
+            row[0] = i;
+            return row;
+        });
+        for (let j = 0; j <= n; j++) dp[0][j] = j;
+        for (let i = 1; i <= m; i++) {
+            for (let j = 1; j <= n; j++) {
+                dp[i][j] = Math.min(
+                    dp[i - 1][j] + 1,
+                    dp[i][j - 1] + 1,
+                    dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)
+                );
+            }
+        }
+        return 1 - dp[m][n] / Math.max(m, n);
+    }
+    const FUZZY_THRESHOLD = 0.8;
+    /* 模糊匹配率超过该值（>90%）时，录入视为“同一题”：
+       覆盖更新该题的题干与答案到远程仓库，而不是新增 */
+    const FUZZY_UPDATE_THRESHOLD = 0.90;
+    /* 在给定列表中找与 pageCq 模糊相似度 >90% 的最佳题目；无则返回 null */
+    function findBestFuzzy(list, pageCq) {
+        let bestIdx = -1, bestScore = 0;
+        const plen = pageCq.length;
+        for (let i = 0; i < list.length; i++) {
+            const cq = cleanText(list[i].q);
+            const qlen = cq.length;
+            if (!qlen || !plen) continue;
+            if (Math.abs(plen - qlen) / Math.max(plen, qlen) > 0.2) continue;
+            const s = similarity(pageCq, cq);
+            if (s > bestScore) { bestScore = s; bestIdx = i; }
+        }
+        if (bestIdx >= 0 && bestScore > FUZZY_UPDATE_THRESHOLD) return { index: bestIdx, score: bestScore };
+        return null;
+    }
+    function normAns(s) {
+        if (!s) return '';
+        const letters = String(s).toUpperCase().match(/[A-Z]/g);
+        if (letters && letters.length) return letters.slice().sort().join('');
+        return String(s).trim().toUpperCase();
+    }
+    function allBank() {
+        return DB.get().concat(RemoteBank.list());
+    }
+    let _index = null;
+    function invalidateIndex() { _index = null; }
+    function buildIndex() {
+        const items = [];
+        const exactMap = new Map();
+        allBank().forEach(it => {
+            const cq = cleanText(it.q);
+            if (!cq) return;
+            items.push({ it, cq });
+            if (!exactMap.has(cq)) exactMap.set(cq, it);
+        });
+        _index = { items, exactMap };
+        return _index;
+    }
+    function getIndex() { return _index || buildIndex(); }
+    function matchQuestion(stemText) {
+        const page = cleanText(stemText);
+        if (!page) return null;
+        const idx = getIndex();
+        const exact = idx.exactMap.get(page);
+        if (exact) return { item: exact, type: '完全匹配', score: 1 };
+        for (const { it, cq } of idx.items) {
+            if (cq.length >= 6 && (page.includes(cq) || cq.includes(page))) {
+                return { item: it, type: '包含匹配', score: 0.99 };
+            }
+        }
+        let best = null, bestScore = 0;
+        const plen = page.length;
+        for (const { it, cq } of idx.items) {
+            const qlen = cq.length;
+            if (!qlen) continue;
+            if (Math.abs(plen - qlen) / Math.max(plen, qlen) > 0.2) continue;
+            const s = similarity(page, cq);
+            if (s > bestScore) { bestScore = s; best = it; }
+        }
+        if (best && bestScore >= FUZZY_THRESHOLD) {
+            return { item: best, type: '模糊匹配', score: bestScore };
+        }
+        return null;
+    }
+    /* =========================================================
+     * 4. 网页题目解析
+     * =======================================================*/
+    function extractStem(stemEl) {
+        const contentEl = stemEl.querySelector('div.content') || stemEl;
+        const clone = contentEl.cloneNode(true);
+        clone.querySelectorAll('font').forEach(f => {
+            if ((f.textContent || '').includes('题目分值')) f.remove();
+        });
+        return (clone.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+    function getFollowingBlocks(stemEl) {
+        let listEl = null, asyncEl = null, cur = stemEl.nextElementSibling;
+        while (cur) {
+            if (cur.classList.contains('content-stem')) break;
+            if (cur.classList.contains('content-list') && !listEl) listEl = cur;
+            if (cur.classList.contains('async_con') && !asyncEl) asyncEl = cur;
+            cur = cur.nextElementSibling;
+        }
+        return { listEl, asyncEl };
+    }
+    function extractOptions(listEl) {
+        const opts = [];
+        if (!listEl) return opts;
+        listEl.querySelectorAll('div.content-option').forEach(op => {
+            const input = op.querySelector('input');
+            const letter = (input && input.value) ||
+                ((op.querySelector('strong') || {}).textContent || '').replace(/[.．、\s]/g, '');
+            const p = op.querySelector('p');
+            const text = p ? (p.textContent || '').trim() : (op.textContent || '').trim();
+            opts.push(letter + '.' + text);
+        });
+        return opts;
+    }
+    function extractWebAnswer(asyncEl) {
+        if (!asyncEl) return '';
+        const ps = asyncEl.querySelectorAll('p');
+        for (const p of ps) {
+            if ((p.textContent || '').includes('正确答案')) {
+                const i = p.querySelector('i');
+                return ((i && i.textContent) || '').trim();
+            }
+        }
+        return '';
+    }
+    function getQuestionId(stemEl, listEl) {
+        if (listEl) {
+            const input = listEl.querySelector('input');
+            if (input && input.name) return input.name;
+        }
+        const a = stemEl.querySelector('a[name]');
+        return a ? a.name : cleanText(extractStem(stemEl)).slice(0, 24);
+    }
+    function questionNo(stemEl) {
+        const span = stemEl.querySelector('span');
+        const m = span && String(span.textContent || '').match(/(\d+)/);
+        return m ? m[1] : '';
+    }
+    function sectionName(stemEl) {
+        const tc = stemEl.closest('div.type-content');
+        if (!tc) return '';
+        const prev = tc.previousElementSibling;
+        if (prev && prev.classList.contains('type-title')) {
+            const b = prev.querySelector('b');
+            if (b) return String(b.textContent || '').replace(/【[\s\S]*/, '').trim();
+        }
+        return '';
+    }
+    /* =========================================================
+     * 5. 逐题扫描 + 可视化反馈
+     * =======================================================*/
+    let stat = { total: 0, matched: 0, missed: 0, conflict: 0, pending: 0 };
+    function cssEscape(s) {
+        if (window.CSS && CSS.escape) return CSS.escape(s);
+        return String(s).replace(/[^a-zA-Z0-9_\u00a0-\uffff-]/g, '\\$&');
+    }
+    function ensureFlag(qid, listEl, asyncEl) {
+        let flag = document.querySelector('div.' + CLS_FLAG + '[data-ah-id="' + cssEscape(qid) + '"]');
+        if (!flag) {
+            flag = document.createElement('div');
+            flag.className = CLS_FLAG;
+            flag.dataset.ahId = qid;
+            if (asyncEl && asyncEl.parentNode) asyncEl.parentNode.insertBefore(flag, asyncEl);
+            else if (listEl && listEl.parentNode) listEl.parentNode.insertBefore(flag, listEl.nextSibling);
+        }
+        return flag;
+    }
+    function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+            ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+    function renderFlag(flag, result, stemText, options, webAns) {
+        webAns = (webAns || '').trim();
+        flag.dataset.stem = stemText;
+        flag.dataset.options = JSON.stringify(options);
+        flag.dataset.webans = webAns;
+        if (result && result.type === '完全匹配') {
+            const it = result.item;
+            flag.className = CLS_FLAG + ' ' + CLS_OK;
+            let note = '';
+            if (webAns && normAns(webAns)) {
+                note = normAns(webAns) === normAns(it.ans)
+                    ? '<div class="ah-same">✔ 与网页正确答案一致（' + escapeHtml(webAns) + '）</div>'
+                    : '<div class="ah-note">ℹ 网页标注答案：' + escapeHtml(webAns) + '（与题库不同，未做修改）</div>';
+            }
+            flag.innerHTML =
+                '✅ 题库完全匹配，答案：<b>' + escapeHtml(it.ans) + '</b>' +
+                '<span class="ah-tag">完全匹配</span>' + note;
+            return;
+        }
+        if (result) {
+            const it = result.item;
+            const pct = result.type === '模糊匹配' ? '（相似度 ' + Math.round(result.score * 100) + '%）' : '';
+            const overwrite = result.score > FUZZY_UPDATE_THRESHOLD;
+            flag.className = CLS_FLAG + ' ' + CLS_NO + ' has-fuzzy';
+            let note = '';
+            if (webAns && normAns(webAns)) {
+                note = normAns(webAns) === normAns(it.ans)
+                    ? '<div class="ah-same">✔ 网页正确答案：' + escapeHtml(webAns) + '（与参考一致）</div>'
+                    : '<div class="ah-note">ℹ 网页标注答案：' + escapeHtml(webAns) + '</div>';
+            }
+            const prefill = webAns || it.ans;
+            flag.innerHTML =
+                '⚠ 题目与题库<b>不完全匹配</b>（' + result.type + pct + '），参考答案：<b>' + escapeHtml(it.ans) + '</b>' +
+                '<span class="ah-tag">' + result.type + '</span>' + note +
+                '<div class="ah-prompt">' + (overwrite
+                    ? '📝 与题库相似度 ≥90%，录入将<b>覆盖更新</b>远程原题：'
+                    : '📝 题目不同，建议录入新题：') +
+                '<input type="text" value="' + escapeHtml(prefill) + '" placeholder="如 A / BCD">' +
+                '<button data-act="add">' + (overwrite ? '覆盖更新并同步远程' : '录入并同步远程') + '</button></div>';
+            return;
+        }
+        flag.className = CLS_FLAG + ' ' + CLS_NO;
+        flag.innerHTML =
+            '❌ 未找到该题目' + (webAns ? '（网页标注答案：' + escapeHtml(webAns) + '）' : '') +
+            '<div class="ah-prompt">📝 录入新题：' +
+            '<input type="text" placeholder="如 A / BCD"' +
+            (webAns ? ' value="' + escapeHtml(webAns) + '"' : '') + '>' +
+            '<button data-act="add">录入并同步远程</button></div>';
+    }
+    function scanAll() {
+        const stems = document.querySelectorAll('div.content-stem');
+        stat = { total: stems.length, matched: 0, missed: 0, conflict: 0, pending: 0 };
+        invalidateIndex();
+        stems.forEach(stemEl => {
+            const { listEl, asyncEl } = getFollowingBlocks(stemEl);
+            const stemText = extractStem(stemEl);
+            const options = extractOptions(listEl);
+            const webAns = extractWebAnswer(asyncEl);
+            const qid = getQuestionId(stemEl, listEl);
+            const flag = ensureFlag(qid, listEl, asyncEl);
+            const result = matchQuestion(stemText);
+            renderFlag(flag, result, stemText, options, webAns);
+            if (result) {
+                stat.matched++;
+                if (result.type !== '完全匹配') stat.pending++;
+                if (webAns && normAns(webAns) && normAns(webAns) !== normAns(result.item.ans)) stat.conflict++;
+            } else {
+                stat.missed++;
+                stat.pending++;
+            }
+        });
+        updateStat();
+        return stat;
+    }
+    /* =========================================================
+     * 6. 自动答题（直接作答，无人工模拟）
+     * =======================================================*/
+    const SET_KEY = 'localQuestionDB_cdeledu_settings';
+    const Settings = {
+        get() {
+            try {
+                return Object.assign({ auto: false, onlyExact: true, saveProgress: true },
+                    JSON.parse(localStorage.getItem(SET_KEY) || '{}'));
+            } catch (e) { return { auto: false, onlyExact: true, saveProgress: true }; }
+        },
+        save(s) { localStorage.setItem(SET_KEY, JSON.stringify(s)); }
+    };
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const GAP_OPTION = 90;
+    const GAP_QUESTION = 180;
+    let autoRunning = false;
+    let autoStop = false;
+    let autoTimer = null;
+    function setAutoStatus(t) {
+        const el = document.getElementById(P + 'autostat');
+        if (el) el.textContent = t;
+    }
+    function questionAnswered(listEl) {
+        if (!listEl) return false;
+        const inputs = listEl.querySelectorAll('input');
+        return Array.from(inputs).some(i => i.checked);
+    }
+    function optionInfo(op) {
+        const input = op.querySelector('input');
+        const strong = op.querySelector('strong');
+        const p = op.querySelector('p');
+        const iEl = op.querySelector('i');
+        const letter = String((input && input.value) || '').trim().toUpperCase() ||
+            String((strong && strong.textContent) || '').replace(/[.．、\s]/g, '').trim().toUpperCase();
+        const text = p ? (p.textContent || '').trim() : (op.textContent || '').trim();
+        return { input, letter, text, iEl };
+    }
+    function answerTokens(ans) {
+        const s = normAns(ans);
+        if (!s) return [];
+        if (/^[A-Z]+$/.test(s)) return s.split('');
+        return [s];
+    }
+    function tokenAliases(t) {
+        const aliases = [t];
+        if (t === '对' || t === '正确' || t === '√' || t === '是' || t === 'TRUE' || t === 'T') aliases.push('对', '正确', '√');
+        if (t === '错' || t === '错误' || t === '×' || t === '否' || t === 'FALSE' || t === 'F') aliases.push('错', '错误', '×');
+        return aliases;
+    }
+    function findOptionByToken(ops, token) {
+        token = String(token).trim().toUpperCase();
+        const byLetter = ops.filter(o => o.letter && o.letter === token);
+        if (byLetter.length) return byLetter[0];
+        const aliases = tokenAliases(token);
+        for (const o of ops) {
+            const t = String(o.text || '').replace(/\s+/g, '');
+            for (const al of aliases) {
+                if (t && (t.includes(al) || al.includes(t))) return o;
+            }
+        }
+        for (const o of ops) {
+            const t = String(o.text || '').replace(/\s+/g, '').replace(/^[A-Z][.．、]/, '');
+            for (const al of aliases) {
+                if (t && (t.includes(al) || al.includes(t))) return o;
+            }
+        }
+        return null;
+    }
+    async function setOptionChecked(op, wantChecked) {
+        const input = op.input;
+        if (!input) return false;
+        if (input.checked === wantChecked) return true;
+        if (op.iEl) {
+            try { op.iEl.click(); } catch (e) { /* 忽略 */ }
+            await sleep(GAP_OPTION);
+            if (input.checked === wantChecked) return true;
+        }
+        try { input.click(); } catch (e) { /* 忽略 */ }
+        await sleep(GAP_OPTION);
+        if (input.checked === wantChecked) return true;
+        input.checked = wantChecked;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event('click', { bubbles: true }));
+        return true;
+    }
+    async function autoAnswerQuestion(stemEl) {
+        const { listEl } = getFollowingBlocks(stemEl);
+        if (!listEl) return { done: false, reason: 'no-options' };
+        if (questionAnswered(listEl)) return { done: false, reason: 'answered' };
+        const result = matchQuestion(extractStem(stemEl));
+        if (!result) return { done: false, reason: 'no-match' };
+        if (Settings.get().onlyExact && result.type !== '完全匹配') return { done: false, reason: 'not-exact' };
+        const ops = Array.from(listEl.querySelectorAll('div.content-option')).map(optionInfo);
+        if (!ops.length) return { done: false, reason: 'no-options' };
+        let tokens = answerTokens(result.item.ans);
+        if (!tokens.length) return { done: false, reason: 'bad-answer' };
+        const isRadio = ops.some(o => o.input && o.input.type === 'radio');
+        if (isRadio) tokens = tokens.slice(0, 1);
+        let clicked = 0;
+        for (const token of tokens) {
+            const op = findOptionByToken(ops, token);
+            if (!op || !op.input) continue;
+            if (op.input.checked) { clicked++; continue; }
+            await setOptionChecked(op, true);
+            clicked++;
+            await sleep(GAP_OPTION);
+        }
+        return { done: clicked > 0, mode: result.type };
+    }
+    async function clickSaveProgress() {
+        const btn = document.querySelector('div.content-save');
+        if (!btn) return false;
+        try { btn.click(); } catch (e) { /* 忽略 */ }
+        await sleep(300);
+        return true;
+    }
+    async function startAutoAnswer() {
+        if (autoRunning) return;
+        autoRunning = true;
+        autoStop = false;
+        const stems = Array.from(document.querySelectorAll('div.content-stem'));
+        const cnt = { done: 0, answered: 0, noMatch: 0, notExact: 0, other: 0 };
+        setAutoStatus('⏳ 自动答题中…（共 ' + stems.length + ' 题）');
+        for (const stemEl of stems) {
+            if (autoStop) break;
+            const sec = sectionName(stemEl);
+            const no = questionNo(stemEl);
+            const r = await autoAnswerQuestion(stemEl);
+            if (r.done) cnt.done++;
+            else if (r.reason === 'answered') cnt.answered++;
+            else if (r.reason === 'no-match') cnt.noMatch++;
+            else if (r.reason === 'not-exact') cnt.notExact++;
+            else cnt.other++;
+            setAutoStatus('⏳ 自动答题中… ' + (sec || '') + (no ? ' 第 ' + no + ' 题' : '') +
+                '（已作答 ' + cnt.done + ' / 共 ' + stems.length + ' 题）');
+            if (r.done) {
+                console.log('[题库助手] 已自动作答：' + (sec || '') + (no ? ' 第' + no + '题' : '') +
+                    '，匹配类型：' + (r.mode || ''));
+            }
+            await sleep(GAP_QUESTION);
+        }
+        let saved = false;
+        if (!autoStop && cnt.done > 0 && Settings.get().saveProgress) saved = await clickSaveProgress();
+        autoRunning = false;
+        const detail = '作答 ' + cnt.done + ' / 已做过 ' + cnt.answered +
+            ' / 无匹配 ' + cnt.noMatch + ' / 非完全匹配跳过 ' + cnt.notExact;
+        setAutoStatus(autoStop
+            ? '⏹ 已手动停止（' + detail + '）'
+            : '✅ 自动答题完成（' + detail + '）' + (saved ? '，已保存进度' : ''));
+        autoStop = false;
+    }
+    function stopAutoAnswer() {
+        autoStop = true;
+        setAutoStatus('⏹ 正在停止…');
+    }
+    function scheduleAutoAnswer(minDelay) {
+        if (autoRunning) return;
+        clearTimeout(autoTimer);
+        autoTimer = setTimeout(startAutoAnswer, minDelay == null ? 800 : minDelay);
+    }
+    /* =========================================================
+     * 7. 总控悬浮面板（精简：匹配查看 + 自动答题；
+     *      远程题库收进 ⚙ 高级设置；GitHub 同步仅源码配置、后台执行）
+     * =======================================================*/
+    function createPanel() {
+        const panel = document.createElement('div');
+        panel.id = ID_PANEL;
+        panel.innerHTML = `
+            <h3 id="${ID_DRAG}">📖 远程题库助手
+                <span class="${CLS_ADVBTN}" title="高级设置（远程题库 / 补充题）">⚙</span>
+                <span class="${CLS_MINBTN}" title="收起/展开">—</span>
+            </h3>
+            <div class="ah-body">
+            <div class="ah-stat" id="${ID_STAT}">题库：0 题</div>
+            <div class="ah-row">
+                <b>② 匹配查看</b><br>
+                <button id="${P}scan">🔄 重新扫描匹配</button>
+            </div>
+            <div class="ah-row">
+                <b>④ 自动答题（直接作答）</b><br>
+                <label style="display:block"><input type="checkbox" id="${P}auto"> 启用自动答题</label>
+                <label style="display:block"><input type="checkbox" id="${P}onlyexact"> 仅自动答「完全匹配」题目（更稳妥）</label>
+                <label style="display:block"><input type="checkbox" id="${P}save"> 答完后自动点击「保存进度」</label>
+                <button id="${P}autorun">▶ 立即自动答题</button>
+                <button id="${P}autostop">⏹ 停止自动答题</button>
+                <div id="${P}autostat" style="color:#666;margin-top:4px">状态：未运行</div>
+            </div>
+            <div class="ah-row" id="${ID_MSG}" style="color:#666"></div>
+            <div class="ah-adv">
+                <div class="ah-row">
+                    <b>① 远程题库（GitHub）</b><br>
+                    <div style="word-break:break-all;color:#666;font-size:11px;margin:2px 0">${escapeHtml(REMOTE_URL)}</div>
+                    <div style="color:#666;font-size:12px" id="${P}upd">上次更新：-</div>
+                    <button id="${P}fetch">🔄 更新题库（远程拉取）</button>
+                </div>
+                <div class="ah-row">
+                    <b>③ 本地补充题</b><br>
+                    <span style="color:#666;font-size:12px">录入的新题会先存本地，并与远程同步推送</span><br>
+                    <button id="${P}clearsup">🗑 清空补充题</button>
+                </div>
+            </div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+        const $ = s => panel.querySelector(s);
+        const msg = t => { $('#' + ID_MSG).textContent = t; };
+
+        /* —— 面板位置记忆 —— */
+        const pos = PanelPos.get();
+        if (pos) {
+            panel.style.left = pos.x + 'px';
+            panel.style.top = pos.y + 'px';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+        }
+        /* —— 最小化 —— */
+        const minBtn = $('.' + CLS_MINBTN);
+        minBtn.addEventListener('mousedown', e => e.stopPropagation());
+        minBtn.onclick = () => {
+            const isMin = panel.classList.toggle('ah-min');
+            minBtn.textContent = isMin ? '＋' : '—';
+            msg(isMin ? '面板已收起，点击「＋」展开' : '');
+        };
+        /* —— 高级设置展开（远程题库 / 补充题管理；GitHub 同步仅在源码后台执行） —— */
+        const advBtn = $('.' + CLS_ADVBTN);
+        advBtn.addEventListener('mousedown', e => e.stopPropagation());
+        advBtn.onclick = () => {
+            const open = panel.classList.toggle('ah-adv-open');
+            msg(open ? '高级设置已展开' : '高级设置已收起');
+        };
+
+        const settings = Settings.get();
+        $('#' + P + 'auto').checked = !!settings.auto;
+        $('#' + P + 'onlyexact').checked = settings.onlyExact !== false;
+        $('#' + P + 'save').checked = settings.saveProgress !== false;
+
+        $('#' + P + 'fetch').onclick = () => refreshBank(false);
+        $('#' + P + 'scan').onclick = () => {
+            const s = scanAll();
+            msg('扫描完成：匹配 ' + s.matched + ' / 未找到 ' + s.missed + ' / 待录入 ' + s.pending);
+            if (Settings.get().auto && !autoRunning) scheduleAutoAnswer();
+        };
+        $('#' + P + 'clearsup').onclick = () => {
+            if (confirm('确定清空全部本地补充题？此操作不可恢复！')) {
+                DB.clear();
+                invalidateIndex();
+                msg('本地补充题已清空');
+                scanAll();
+            }
+        };
+        $('#' + P + 'auto').onchange = e => {
+            const s = Settings.get();
+            s.auto = e.target.checked;
+            Settings.save(s);
+            msg(s.auto ? '✅ 已开启自动答题（页面题目出现后自动作答）' : '已关闭自动答题');
+            if (s.auto && !autoRunning) scheduleAutoAnswer(300);
+        };
+        $('#' + P + 'onlyexact').onchange = e => {
+            const s = Settings.get();
+            s.onlyExact = e.target.checked;
+            Settings.save(s);
+            msg(s.onlyExact ? '仅自动答「完全匹配」题目' : '允许自动答模糊匹配题目（参考答案作答）');
+        };
+        $('#' + P + 'save').onchange = e => {
+            const s = Settings.get();
+            s.saveProgress = e.target.checked;
+            Settings.save(s);
+            msg(s.saveProgress ? '答完后将自动点击「保存进度」' : '答完后不自动保存进度');
+        };
+        $('#' + P + 'autorun').onclick = () => scheduleAutoAnswer(0);
+        $('#' + P + 'autostop').onclick = stopAutoAnswer;
+
+        /* —— 录入新题：本地补充 + 后台自动推送远程 —— */
+        document.addEventListener('click', async e => {
+            const btn = e.target.closest('div.' + CLS_FLAG + ' button');
+            if (!btn || btn.dataset.act !== 'add') return;
+            const flag = btn.closest('div.' + CLS_FLAG);
+            const stem = flag.dataset.stem || '';
+            const options = JSON.parse(flag.dataset.options || '[]');
+            const input = flag.querySelector('input');
+            const ans = (input.value || '').trim();
+            if (!ans) { alert('请先填写答案，如 A 或 BCD'); return; }
+            const r = DB.addNew(stem, options, String(ans).toUpperCase());
+            if (!r.ok) { alert(r.msg); return; }
+            invalidateIndex();
+            scanAll();
+            if (r.alreadyInRemote) { msg(r.msg); return; }
+            const gh2 = GH.get();
+            if (gh2.auto && gh2.repo && gh2.token) {
+                msg('⏳ 已存本地，后台推送远程…');
+                try {
+                    const pr = await GH.pushQuestion(stem, options, String(ans).toUpperCase());
+                    msg(pr.msg);
+                    if (!pr.skipped && pr.arr) {
+                        RemoteBank.save(pr.arr, new Date().toISOString());
+                        invalidateIndex();
+                        scanAll();
+                    }
+                } catch (e) {
+                    console.error('[题库助手] 推送远程失败：', e);
+                    msg('⚠ 已存本地，推送远程失败：' + e.message);
+                }
+            } else {
+                msg(r.msg + '；（未配置 GitHub，仅存本地）');
+            }
+        });
+        makeDraggable(panel, $('#' + ID_DRAG));
+        updateStat();
+    }
+    function fmtTime(iso) {
+        if (!iso) return '-';
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return iso;
+        return d.toLocaleString();
+    }
+    function updateStat() {
+        const el = document.getElementById(ID_STAT);
+        if (!el) return;
+        const remoteN = RemoteBank.list().length;
+        const supN = DB.get().length;
+        el.innerHTML = '题库：远程 <b>' + remoteN + '</b> 题 + 补充 <b>' + supN + '</b> 题 ｜ 本页 ' +
+            stat.total + ' 题：<span style="color:#137333">匹配 ' + stat.matched +
+            '</span> / <span style="color:#cf1322">未找到 ' + stat.missed + '</span>' +
+            (stat.pending ? ' / <span style="color:#d46b08">待录入 ' + stat.pending + '</span>' : '') +
+            (stat.conflict ? ' / <span style="color:#d46b08">答案冲突 ' + stat.conflict + '</span>' : '');
+        const upEl = document.getElementById(P + 'upd');
+        if (upEl) upEl.textContent = '上次更新：' + fmtTime(RemoteBank.meta().fetchedAt) + (remoteN ? '（' + remoteN + ' 题）' : '（暂无缓存）');
+    }
+    function makeDraggable(panel, handle) {
+        let sx, sy, ox, oy, drag = false;
+        handle.addEventListener('mousedown', e => {
+            if (e.target.closest('.' + CLS_MINBTN) || e.target.closest('.' + CLS_ADVBTN)) return;
+            drag = true;
+            const rect = panel.getBoundingClientRect();
+            sx = e.clientX; sy = e.clientY; ox = rect.left; oy = rect.top;
+            e.preventDefault();
+        });
+        document.addEventListener('mousemove', e => {
+            if (!drag) return;
+            const maxX = Math.max(0, window.innerWidth - 60);
+            const maxY = Math.max(0, window.innerHeight - 40);
+            const x = Math.min(Math.max(ox + e.clientX - sx, 0), maxX);
+            const y = Math.min(Math.max(oy + e.clientY - sy, 0), maxY);
+            panel.style.left = x + 'px';
+            panel.style.top = y + 'px';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+        });
+        document.addEventListener('mouseup', () => {
+            if (drag) {
+                const rect = panel.getBoundingClientRect();
+                PanelPos.save({ x: rect.left, y: rect.top });
+            }
+            drag = false;
+        });
+    }
+    /* =========================================================
+     * 8. 后台维护：题库拉取 / 定时静默更新 / 启动
+     * =======================================================*/
+    let _fetching = false;
+    async function refreshBank(silent) {
+        if (_fetching) return;
+        _fetching = true;
+        const btn = document.getElementById(P + 'fetch');
+        if (btn && !silent) { btn.disabled = true; btn.textContent = '⏳ 正在更新…'; }
+        try {
+            const arr = await RemoteBank.fetchLatest();
+            const old = RemoteBank.list();
+            const changed = arr.length !== old.length ||
+                (old[0] && arr[0] ? cleanText(old[0].q) !== cleanText(arr[0].q) : true) ||
+                (old[old.length - 1] && arr[arr.length - 1] ? cleanText(old[old.length - 1].q) !== cleanText(arr[arr.length - 1].q) : true);
+            RemoteBank.save(arr, new Date().toISOString());
+            invalidateIndex();
+            updateStat();
+            if (changed) {
+                scanAll();
+                console.log('[题库助手] 后台题库已更新：共 ' + arr.length + ' 题');
+                if (!silent) msg('✅ 远程题库已更新：共 ' + arr.length + ' 题');
+            } else if (!silent) {
+                msg('✅ 题库已是最新：共 ' + arr.length + ' 题');
+            }
+        } catch (e) {
+            const hasCache = RemoteBank.list().length > 0;
+            console.error('[题库助手] 更新失败：', e);
+            if (!silent) msg('❌ 更新失败：' + e.message + (hasCache ? '（已使用缓存题库）' : '（暂无可用题库）'));
+            if (!hasCache) updateStat();
+        } finally {
+            _fetching = false;
+            if (btn && !silent) { btn.disabled = false; btn.textContent = '🔄 更新题库（远程拉取）'; }
+        }
+    }
+    let scanTimer = null;
+    function debouncedScan() {
+        clearTimeout(scanTimer);
+        scanTimer = setTimeout(scanAll, 300);
+    }
+    function ensureRunning() {
+        if (!document.getElementById(ID_PANEL)) createPanel();
+        const n = document.querySelectorAll('div.content-stem').length;
+        if (n !== boot._lastN) {
+            boot._lastN = n;
+            debouncedScan();
+            if (Settings.get().auto && !autoRunning) scheduleAutoAnswer(300);
+        }
+    }
+    function startObserver() {
+        if (boot._obs) return;
+        boot._obs = new MutationObserver(ensureRunning);
+        boot._obs.observe(document.body, { childList: true, subtree: true });
+    }
+    function boot() {
+        startObserver();
+        if (!document.getElementById(ID_PANEL)) createPanel();
+        if (RemoteBank.list().length) {
+            scanAll();
+            refreshBank(true);          // 后台静默拉取最新
+        } else {
+            const msgEl = document.getElementById(ID_MSG);
+            if (msgEl) msgEl.textContent = '⏳ 正在从远程仓库获取题库…';
+            refreshBank(false).then(() => {
+                if (document.querySelectorAll('div.content-stem').length) scanAll();
+            });
+        }
+        if (document.querySelector('div.content-stem') && Settings.get().auto && !autoRunning) {
+            scheduleAutoAnswer(500);
+        }
+        boot._lastN = document.querySelectorAll('div.content-stem').length;
+        /* 后台定时检查更新：每 30 分钟静默拉取一次 */
+        setInterval(() => refreshBank(true), 30 * 60 * 1000);
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        boot();
+    }
+})();
